@@ -11,6 +11,8 @@ real OpenAI-compatible server (Ollama, vLLM, OpenRouter...).
 
 Three parallel patterns are shown:
   1. fan_out_gather  — independent subtasks, run concurrently, then merge
+  1b. decompose_parallel — K planners propose decompositions concurrently,
+                           a judge picks the best plan before fan-out
   2. best_of_n       — same task, N independent attempts, verifier picks best
   3. tree_expand     — branch at each step, prune losers, continue winners
 """
@@ -78,14 +80,61 @@ async def llm_call(prompt: str, tag: str = "",
 # The ONLY thing that makes it parallel is asyncio.gather.
 # Total wall-clock time ≈ max(subtask times), not sum.
 # ---------------------------------------------------------------------------
-async def decompose(task: str) -> List[str]:
+async def decompose(task: str, seed: int = 0) -> List[str]:
     # Planner role -> big model, low temperature, bigger budget.
-    plan_text = await llm_call(f"Break into independent subtasks: {task}", tag="planner",
-                               model=MODEL_PLANNER, temperature=0.3, max_tokens=1024)
+    # Temperature varies per seed so parallel planners actually diverge
+    # (same trick as best-of-N attempts varying temperature per seed).
+    plan_text = await llm_call(f"Break into independent subtasks: {task}",
+                               tag=f"planner-{seed}",
+                               model=MODEL_PLANNER,
+                               temperature=0.3 + 0.1 * (seed % 3),
+                               max_tokens=1024)
     # Real code: parse the model's numbered list (like LangChain's PlanningOutputParser).
-    # Stub: pretend it returned 3 subtasks.
+    # Stub: pretend it returned 3 subtasks (tagged by seed so the demo shows divergence).
     _ = plan_text
-    return [f"{task} :: subtask {i}" for i in (1, 2, 3)]
+    return [f"{task} :: subtask {i} [plan-{seed}]" for i in (1, 2, 3)]
+
+
+async def judge_pick(task: str, plans: List[List[str]]) -> List[str]:
+    """Pick the best decomposition out of K planner candidates.
+
+    Judge role -> big model: plan quality caps the whole fan-out, so the
+    judge gets the smart model and a low temperature. Returns the winning
+    plan; falls back to plans[0] if the judge output is unparseable.
+    """
+    rendered = "\n\n".join(
+        f"Plan {i}:\n" + "\n".join(f"  - {s}" for s in plan)
+        for i, plan in enumerate(plans)
+    )
+    verdict = await llm_call(
+        f"Task: {task}\nCandidate decompositions:\n{rendered}\n"
+        f"Which plan splits the task into the most independent and complete "
+        f"subtasks? Reply with ONLY the plan number (0-{len(plans) - 1}).",
+        tag="plan-judge", model=MODEL_PLANNER, temperature=0.2, max_tokens=16,
+    )
+    try:
+        idx = int(verdict.strip().split()[0])
+        if 0 <= idx < len(plans):
+            return plans[idx]
+    except (ValueError, IndexError):
+        pass
+    return plans[0]  # stub mode or unparseable judge output -> safe fallback
+
+
+async def decompose_parallel(task: str, k: int = 3) -> List[str]:
+    """Parallel planners (planner-level best-of-N).
+
+    K planners propose decompositions CONCURRENTLY, then a judge picks the
+    best plan before fan-out begins.
+
+    Cost note: the planner is the most expensive role (big model), so this
+    costs K planner calls + 1 judge call. Worth it only when decomposition
+    quality has high variance; if the planner is already stable, keep K=1.
+    """
+    plans: List[List[str]] = await asyncio.gather(
+        *[decompose(task, seed=i) for i in range(k)]
+    )
+    return await judge_pick(task, plans)
 
 
 async def solve_subtask(subtask: str, context: str = "") -> str:
@@ -105,8 +154,11 @@ async def aggregate(task: str, subtasks: List[str], results: List[str]) -> str:
                           temperature=0.3, max_tokens=2048)
 
 
-async def fan_out_gather(task: str) -> str:
-    subtasks = await decompose(task)
+async def fan_out_gather(task: str, planner_k: int = 1) -> str:
+    # planner_k=1 -> single planner (original behavior).
+    # planner_k>1 -> K planners race concurrently, judge picks the best plan.
+    subtasks = await (decompose_parallel(task, k=planner_k) if planner_k > 1
+                      else decompose(task))
     # ---- THIS IS THE PARALLELISM ----
     # asyncio.gather schedules all coroutines concurrently on one event loop.
     # No threads, no processes: concurrency comes from awaiting I/O (the LLM API).
@@ -220,6 +272,9 @@ async def main() -> None:
 
     print("== Pattern 1: fan-out / fan-in ==")
     print(await fan_out_gather(task), "\n")
+
+    print("== Pattern 1b: fan-out / fan-in with parallel planners (k=3) ==")
+    print(await fan_out_gather(task, planner_k=3), "\n")
 
     print("== Pattern 2: best-of-N ==")
     print(await best_of_n(task, n=3), "\n")

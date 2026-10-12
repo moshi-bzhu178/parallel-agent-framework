@@ -5,6 +5,7 @@ An async Python framework implementing parallel LLM-agent execution patterns —
 ## Patterns
 
 1. **Fan-out / fan-in** — decompose a task into independent subtasks, run them concurrently with `asyncio.gather`, then aggregate. Wall-clock time ≈ slowest branch, not the sum.
+   - **Parallel planners (1b)** — `fan_out_gather(task, planner_k=K)` runs K planners concurrently (varied temperature seeds so they diverge), then a judge picks the best decomposition before fan-out. Planner is the most expensive role, so this costs K planner calls + 1 judge call; use it when decomposition quality has high variance, keep K=1 otherwise.
 2. **Best-of-N** — N independent attempts at the same task (varied temperature seeds), scored by a verifier; the best wins.
 3. **Tree expansion with pruning** — beam search over reasoning paths: expand every frontier node concurrently, score all candidates concurrently, keep top-k.
 
