@@ -1,0 +1,2 @@
+# Optional — without the openai package the framework runs in offline stub mode.
+openai>=1.0.0
