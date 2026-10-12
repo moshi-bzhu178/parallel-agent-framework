@@ -34,6 +34,18 @@ export LLM_MAX_CONCURRENCY="8"                     # semaphore-bounded concurren
 python parallel_decompose.py
 ```
 
+## Token usage
+
+Every `llm_call` is logged to `USAGE_LOG` as `(tag, model, prompt_tokens, completion_tokens)`.
+With a real model the counts come from `resp.usage`; in stub mode they are estimated with a
+`len(text)//4` heuristic so the measurement pipeline works end-to-end before wiring up a model.
+`reset_usage()` clears the log and `print_usage_summary()` prints per-role totals;
+`main()` prints a per-pattern summary after each run. This is the harness for testing the
+token-consumption hypotheses: fan-out linear in #subtasks, best-of-N linear in N,
+tree multiplicative in depth x branch x beam, 32B calls few but quality-capping.
+`benchmark.py` sweeps 14 configs (subtask counts, N, depth/branch/beam, planner k)
+with repeats, writing per-run token usage and wall time to `benchmark_results.csv`.
+
 ## Design notes
 
 - Concurrency is `asyncio`-based (no threads, no processes) — it comes from awaiting LLM API I/O.

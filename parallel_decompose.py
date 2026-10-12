@@ -51,6 +51,53 @@ except ImportError:  # no `openai` package -> fall back to stub below
 _sem = asyncio.Semaphore(int(os.environ.get("LLM_MAX_CONCURRENCY", "8")))
 
 
+# ---------------------------------------------------------------------------
+# Usage tracking: measure token consumption per call, per role, per pattern.
+#
+# In real mode the counts come from resp.usage. In stub mode they are
+# estimated with a len//4 heuristic so the measurement pipeline works
+# end-to-end before a real model is wired up. Call reset_usage() before a
+# pattern run and print_usage_summary() after to get per-pattern totals --
+# this is how the token-consumption hypotheses get tested:
+#   H1 fan-out  ~ linear in #subtasks
+#   H2 best-of-N ~ linear in N, quality gains diminish
+#   H3 tree     ~ multiplicative in depth x branch x beam
+#   H4 heterogeneous: 32B calls are few (<10%) but cap quality
+# ---------------------------------------------------------------------------
+USAGE_LOG: List[dict] = []
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def reset_usage() -> None:
+    USAGE_LOG.clear()
+
+
+def usage_summary() -> dict:
+    by_tag: dict = {}
+    for e in USAGE_LOG:
+        d = by_tag.setdefault(e["tag"], {"calls": 0, "prompt": 0, "completion": 0})
+        d["calls"] += 1
+        d["prompt"] += e["prompt_tokens"]
+        d["completion"] += e["completion_tokens"]
+    return {
+        "calls": len(USAGE_LOG),
+        "prompt_tokens": sum(e["prompt_tokens"] for e in USAGE_LOG),
+        "completion_tokens": sum(e["completion_tokens"] for e in USAGE_LOG),
+        "by_tag": by_tag,
+    }
+
+
+def print_usage_summary() -> None:
+    s = usage_summary()
+    print(f"--- usage: {s['calls']} calls, "
+          f"{s['prompt_tokens']} prompt + {s['completion_tokens']} completion tokens ---")
+    for tag, d in sorted(s["by_tag"].items()):
+        print(f"  {tag:12s} x{d['calls']:2d}  in={d['prompt']:5d}  out={d['completion']:5d}")
+
+
 async def llm_call(prompt: str, tag: str = "",
                    model: str = MODEL_WORKER,
                    max_tokens: int = 512,
@@ -58,7 +105,12 @@ async def llm_call(prompt: str, tag: str = "",
     """One LLM call. Real client when `openai` pkg + server exist, else stub."""
     if _client is None:
         await asyncio.sleep(random.uniform(0.3, 0.8))  # network latency
-        return f"[{tag}:{model}] result for: {prompt[:40]}..."
+        out = f"[{tag}:{model}] result for: {prompt[:40]}..."
+        USAGE_LOG.append({"tag": tag or "untagged", "model": model,
+                          "prompt_tokens": _estimate_tokens(prompt),
+                          "completion_tokens": _estimate_tokens(out),
+                          "estimated": True})
+        return out
     async with _sem:  # bound concurrency: parallel, not unbounded
         resp = await _client.chat.completions.create(
             model=model,
@@ -66,7 +118,13 @@ async def llm_call(prompt: str, tag: str = "",
             max_tokens=max_tokens,      # per-call token budget (dev-set ceiling)
             temperature=temperature,
         )
-        return resp.choices[0].message.content or ""
+        content = resp.choices[0].message.content or ""
+        u = resp.usage  # real token counts when the server reports them
+        USAGE_LOG.append({"tag": tag or "untagged", "model": model,
+                          "prompt_tokens": u.prompt_tokens if u else _estimate_tokens(prompt),
+                          "completion_tokens": u.completion_tokens if u else _estimate_tokens(content),
+                          "estimated": u is None})
+        return content
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +138,7 @@ async def llm_call(prompt: str, tag: str = "",
 # The ONLY thing that makes it parallel is asyncio.gather.
 # Total wall-clock time ≈ max(subtask times), not sum.
 # ---------------------------------------------------------------------------
-async def decompose(task: str, seed: int = 0) -> List[str]:
+async def decompose(task: str, seed: int = 0, n_subtasks: int = 3) -> List[str]:
     # Planner role -> big model, low temperature, bigger budget.
     # Temperature varies per seed so parallel planners actually diverge
     # (same trick as best-of-N attempts varying temperature per seed).
@@ -90,9 +148,10 @@ async def decompose(task: str, seed: int = 0) -> List[str]:
                                temperature=0.3 + 0.1 * (seed % 3),
                                max_tokens=1024)
     # Real code: parse the model's numbered list (like LangChain's PlanningOutputParser).
-    # Stub: pretend it returned 3 subtasks (tagged by seed so the demo shows divergence).
+    # Stub: pretend it returned n_subtasks subtasks (tagged by seed so the
+    # demo shows divergence). n_subtasks is stub-only; real parsing decides.
     _ = plan_text
-    return [f"{task} :: subtask {i} [plan-{seed}]" for i in (1, 2, 3)]
+    return [f"{task} :: subtask {i} [plan-{seed}]" for i in range(1, n_subtasks + 1)]
 
 
 async def judge_pick(task: str, plans: List[List[str]]) -> List[str]:
@@ -121,7 +180,7 @@ async def judge_pick(task: str, plans: List[List[str]]) -> List[str]:
     return plans[0]  # stub mode or unparseable judge output -> safe fallback
 
 
-async def decompose_parallel(task: str, k: int = 3) -> List[str]:
+async def decompose_parallel(task: str, k: int = 3, n_subtasks: int = 3) -> List[str]:
     """Parallel planners (planner-level best-of-N).
 
     K planners propose decompositions CONCURRENTLY, then a judge picks the
@@ -132,7 +191,7 @@ async def decompose_parallel(task: str, k: int = 3) -> List[str]:
     quality has high variance; if the planner is already stable, keep K=1.
     """
     plans: List[List[str]] = await asyncio.gather(
-        *[decompose(task, seed=i) for i in range(k)]
+        *[decompose(task, seed=i, n_subtasks=n_subtasks) for i in range(k)]
     )
     return await judge_pick(task, plans)
 
@@ -154,11 +213,13 @@ async def aggregate(task: str, subtasks: List[str], results: List[str]) -> str:
                           temperature=0.3, max_tokens=2048)
 
 
-async def fan_out_gather(task: str, planner_k: int = 1) -> str:
+async def fan_out_gather(task: str, planner_k: int = 1, n_subtasks: int = 3) -> str:
     # planner_k=1 -> single planner (original behavior).
     # planner_k>1 -> K planners race concurrently, judge picks the best plan.
-    subtasks = await (decompose_parallel(task, k=planner_k) if planner_k > 1
-                      else decompose(task))
+    # n_subtasks is stub-only (real parsing decides the count).
+    subtasks = await (decompose_parallel(task, k=planner_k, n_subtasks=n_subtasks)
+                      if planner_k > 1
+                      else decompose(task, n_subtasks=n_subtasks))
     # ---- THIS IS THE PARALLELISM ----
     # asyncio.gather schedules all coroutines concurrently on one event loop.
     # No threads, no processes: concurrency comes from awaiting I/O (the LLM API).
@@ -271,17 +332,28 @@ async def main() -> None:
     task = "Design a rate limiter for 100k QPS"
 
     print("== Pattern 1: fan-out / fan-in ==")
-    print(await fan_out_gather(task), "\n")
+    reset_usage()
+    print(await fan_out_gather(task))
+    print_usage_summary()
+    print()
 
     print("== Pattern 1b: fan-out / fan-in with parallel planners (k=3) ==")
-    print(await fan_out_gather(task, planner_k=3), "\n")
+    reset_usage()
+    print(await fan_out_gather(task, planner_k=3))
+    print_usage_summary()
+    print()
 
     print("== Pattern 2: best-of-N ==")
-    print(await best_of_n(task, n=3), "\n")
+    reset_usage()
+    print(await best_of_n(task, n=3))
+    print_usage_summary()
+    print()
 
     print("== Pattern 3: tree expansion ==")
+    reset_usage()
     winner = await tree_expand(task, depth=2, branch=2, beam=2)
     print("best path:", winner.state, "score:", round(winner.score, 3))
+    print_usage_summary()
 
 
 if __name__ == "__main__":
